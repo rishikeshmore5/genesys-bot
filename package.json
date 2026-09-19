@@ -1,0 +1,19 @@
+{
+  "name": "genesys-bot",
+  "version": "1.0.0",
+  "main": "bot-server.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node bot-server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google-cloud/speech": "^8.1.0",
+    "@google-cloud/text-to-speech": "^7.1.0",
+    "ws": "^8.21.3"
+  }
+}
