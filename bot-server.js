@@ -10,7 +10,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-console.log('[Bot Init] Running Mock Mode with AudioHook v2 compliance.');
+console.log('[Bot Init] Running Mock Mode with strict AudioHook v2 Binary Framing.');
 
 // Convert 16-bit linear PCM to 8-bit mu-law (G.711 PCMU)
 function linearToMuLaw(sample) {
@@ -43,6 +43,15 @@ function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
   return buffer;
 }
 
+// Wrap raw audio buffer in AudioHook Binary Frame Format
+// [0x02 (Audio Message Type)] + [4-byte Big-Endian Length] + [Raw Audio Data]
+function createAudioHookFrame(audioPayload) {
+  const header = Buffer.alloc(5);
+  header.writeUInt8(0x02, 0); // 0x02 indicates audio data frame
+  header.writeUInt32BE(audioPayload.length, 1);
+  return Buffer.concat([header, audioPayload]);
+}
+
 wss.on('connection', (ws, req) => {
   let serverSeq = 1;
   let clientSeq = 1;
@@ -55,13 +64,15 @@ wss.on('connection', (ws, req) => {
 
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
-    const audioData = generateMockMuLawAudio(1200, 440);
+    const rawAudio = generateMockMuLawAudio(1200, 440);
 
-    // Send in standard 160-byte packets (20ms) or 800-byte packets (100ms)
-    const chunkSize = 640; // 80ms chunks
-    for (let i = 0; i < audioData.length; i += chunkSize) {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(audioData.subarray(i, i + chunkSize));
+    // Stream out in 640-byte audio slices (~80ms each)
+    const chunkSize = 640;
+    for (let i = 0; i < rawAudio.length; i += chunkSize) {
+      if (ws.readyState === ws.OPEN && state !== 'CLOSED') {
+        const slice = rawAudio.subarray(i, i + chunkSize);
+        const framedPacket = createAudioHookFrame(slice);
+        ws.send(framedPacket, { binary: true });
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
     }
@@ -95,13 +106,18 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', async (data, isBinary) => {
-    // 1. CALLER VOICE CHUNKS
+    // 1. CALLER VOICE CHUNKS FROM GENESYS
     if (isBinary) {
-      if (state === 'LISTENING') {
-        audioBuffer.push(data);
+      // If Genesys wrapped incoming audio with header, strip the 5-byte header if present
+      let rawData = data;
+      if (data.length > 5 && data.readUInt8(0) === 0x02) {
+        rawData = data.subarray(5);
+      }
 
-        // Check for mu-law silence
-        const isSilent = data.every(
+      if (state === 'LISTENING') {
+        audioBuffer.push(rawData);
+
+        const isSilent = rawData.every(
           (byte) => byte === 0xff || byte === 0x7f || (byte >= 0x7e && byte <= 0x81)
         );
 
@@ -170,11 +186,8 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'playback_started':
-          console.log('[AudioHook] Genesys confirmed audio playback began.');
-          break;
-
         case 'playback_completed':
-          console.log('[AudioHook] Genesys finished playing prompt to caller. Ready for speech.');
+          console.log(`[AudioHook] Handled playback event: ${msg.type}`);
           break;
 
         case 'ping':
@@ -207,7 +220,7 @@ wss.on('connection', (ws, req) => {
         }
 
         default:
-          console.log(`[AudioHook] Unhandled event type: ${msg.type}`, msg);
+          console.log(`[AudioHook] Event: ${msg.type}`);
       }
     } catch (err) {
       console.error('[AudioHook] JSON parsing error:', err.message);
