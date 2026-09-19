@@ -1,13 +1,20 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
 
+// Render provides PORT dynamically (often 10000)
 const PORT = process.env.PORT || 8080;
-const server = http.createServer();
+
+// 1. Handle Render HTTP health check / port scanner
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('AudioHook Bot Server Running OK\n');
+});
+
 const wss = new WebSocketServer({ server });
 
-console.log('[Bot Init] Running in 100% Mock Mode (Zero external cloud dependencies).');
+console.log('[Bot Init] Running Mock Mode with Render Port Binding.');
 
-// Convert a 16-bit linear PCM sample to an 8-bit mu-law (G.711 PCMU) sample
+// Convert 16-bit linear PCM to 8-bit mu-law (G.711 PCMU)
 function linearToMuLaw(sample) {
   const BIAS = 0x84;
   const CLIP = 32635;
@@ -25,7 +32,7 @@ function linearToMuLaw(sample) {
   return byte & 0xff;
 }
 
-// Generates valid PCMU 8kHz audio packets locally (sine wave tone)
+// Generates valid PCMU 8kHz audio packets
 function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
   const sampleRate = 8000;
   const numSamples = Math.floor((sampleRate * durationMs) / 1000);
@@ -42,18 +49,16 @@ wss.on('connection', (ws) => {
   let serverSeq = 1;
   let clientSeq = 1;
   let sessionId = '';
-  let state = 'INIT'; // INIT -> ASKING_NAME -> LISTENING -> PROCESSING -> PLAYING_INFO -> DISCONNECTING
+  let state = 'INIT';
   let audioBuffer = [];
   let silenceFrames = 0;
 
   console.log('[AudioHook] New incoming connection.');
 
-  // Mock Text-To-Speech: Logs text and streams paced PCMU frames to Genesys
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
     const audioData = generateMockMuLawAudio(1200, 440);
 
-    // Stream out in 800-byte packets (~100ms per packet for 8kHz 8-bit mono)
     const chunkSize = 800;
     for (let i = 0; i < audioData.length; i += chunkSize) {
       if (ws.readyState === ws.OPEN) {
@@ -63,13 +68,11 @@ wss.on('connection', (ws) => {
     }
   }
 
-  // Mock Speech-To-Text: Returns a dummy name
   async function transcribeAudio(buffer) {
-    console.log(`[Bot STT]: Received ${buffer.length} bytes of caller audio. Mocking transcription...`);
+    console.log(`[Bot STT]: Received ${buffer.length} bytes of caller audio.`);
     return 'Alex Mercer';
   }
 
-  // Instruct Genesys to end the AudioHook session and transfer back to Architect
   function disconnectToAgent(callerName) {
     console.log(`[AudioHook] Emitting disconnect to Architect with callerName: "${callerName}"`);
     const disconnectFrame = {
@@ -93,27 +96,23 @@ wss.on('connection', (ws) => {
   }
 
   ws.on('message', async (data, isBinary) => {
-    // 1. RECEIVING CALLER AUDIO STREAM
+    // 1. CALLER VOICE CHUNKS
     if (isBinary) {
       if (state === 'LISTENING') {
         audioBuffer.push(data);
 
-        // // Simple energy detector: 0xFF is mu-law zero-level silence
-        // const isSilent = data.every((byte) => byte > 0x7e && byte < 0x82);
-        // if (isSilent) {
-        //   silenceFrames++;
-        // } else {
-        //   silenceFrames = 0;
-        // }/
-        // Mu-law silence is either 0xFF (negative zero) or 0x7F (positive zero)
-        const isSilent = data.every((byte) => byte === 0xFF || byte === 0x7F || (byte >= 0x7E && byte <= 0x81));
+        // Check for mu-law silence (0xFF or 0x7F)
+        const isSilent = data.every(
+          (byte) => byte === 0xff || byte === 0x7f || (byte >= 0x7e && byte <= 0x81)
+        );
+
         if (isSilent) {
           silenceFrames++;
         } else {
           silenceFrames = 0;
         }
 
-        // When caller stops talking (~1.5 seconds of silence accumulated)
+        // Trigger after ~1.5 seconds of silence and sufficient voice data
         if (silenceFrames > 8 && audioBuffer.length > 15) {
           state = 'PROCESSING';
           const fullAudio = Buffer.concat(audioBuffer);
@@ -123,7 +122,7 @@ wss.on('connection', (ws) => {
           console.log(`[Bot] Resolved Name: ${detectedName}`);
 
           state = 'PLAYING_INFO';
-          await speak(`Thank you ${detectedName}. Your account details are verified. Transferring you to an agent now.`);
+          await speak(`Thank you ${detectedName}. Transferring to an agent.`);
 
           disconnectToAgent(detectedName);
         }
@@ -137,36 +136,42 @@ wss.on('connection', (ws) => {
       clientSeq = msg.seq || clientSeq;
 
       switch (msg.type) {
-        case 'open':
+        case 'open': {
           sessionId = msg.id;
           console.log(`[AudioHook] Session Open request: ${sessionId}`);
 
-          ws.send(
-            JSON.stringify({
-              version: '2',
-              type: 'opened',
-              seq: serverSeq++,
-              clientseq: clientSeq,
-              id: sessionId,
-              parameters: {
-                startPaused: false,
-                media: [
-                  {
-                    type: 'audio',
-                    format: 'PCMU',
-                    channels: ['external'],
-                    rate: 8000,
-                  },
-                ],
-              },
-            })
-          );
+          const requestedMedia = msg.parameters?.media?.[0] || {
+            type: 'audio',
+            format: 'PCMU',
+            channels: ['external'],
+            rate: 8000,
+          };
 
-          // Initial greeting
+          const openedResponse = {
+            version: '2',
+            type: 'opened',
+            seq: serverSeq++,
+            clientseq: clientSeq,
+            id: sessionId,
+            parameters: {
+              startPaused: false,
+              media: [requestedMedia],
+            },
+          };
+
+          ws.send(JSON.stringify(openedResponse));
+
           state = 'ASKING_NAME';
           await speak('Hello! Could you please state your full name?');
           state = 'LISTENING';
           console.log('[AudioHook] Prompt played. Listening for caller audio...');
+          break;
+        }
+
+        case 'playback_started':
+        case 'playback_completed':
+          // Genesys notifies bot of audio playback events; log and maintain connection
+          console.log(`[AudioHook] Handled lifecycle event: ${msg.type}`);
           break;
 
         case 'ping':
@@ -214,6 +219,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`AudioHook Bot Server active on :${PORT}`);
+// Explicitly bind 0.0.0.0 so Render port scanner detects it
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`AudioHook Bot Server active on 0.0.0.0:${PORT}`);
 });
