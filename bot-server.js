@@ -49,18 +49,17 @@ wss.on('connection', (ws, req) => {
   let audioBuffer = [];
   let silenceFrames = 0;
   let hasInitiatedGreeting = false;
+  let noInputTimer = null;
 
   console.log(`[AudioHook] Client connected: ${req.url}`);
 
-  // Stream PCMU audio paced precisely to real-time wall clock
+  // Stream PCMU audio paced precisely to real-time wall clock (80ms chunks)
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
     const rawAudio = generateMockMuLawAudio(1200, 440);
 
-    // 640 bytes = 80ms of audio at 8000 Hz 8-bit mono
-    const chunkSize = 640; 
-    const frameDurationMs = (chunkSize / 8000) * 1000; // 80 ms
-
+    const chunkSize = 640; // 80ms chunks
+    const frameDurationMs = (chunkSize / 8000) * 1000;
     let nextSendTime = Date.now();
 
     for (let i = 0; i < rawAudio.length; i += chunkSize) {
@@ -78,7 +77,9 @@ wss.on('connection', (ws, req) => {
   }
 
   function disconnectToAgent(callerName) {
+    if (noInputTimer) clearTimeout(noInputTimer);
     console.log(`[AudioHook] Emitting disconnect to Architect with callerName: "${callerName}"`);
+
     const disconnectFrame = {
       version: '2',
       type: 'disconnect',
@@ -100,15 +101,26 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', async (data, isBinary) => {
-    // 1. CALLER VOICE CHUNKS
+    // 1. INCOMING CALLER AUDIO CHUNKS
     if (isBinary) {
       if (!hasInitiatedGreeting) {
         hasInitiatedGreeting = true;
         state = 'ASKING_NAME';
-        console.log('[AudioHook] Media channel ready! Playing greeting prompt...');
+        console.log('[AudioHook] Media channel verified! Playing prompt...');
         await speak('Hello! Could you please state your full name?');
         state = 'LISTENING';
-        console.log('[AudioHook] Listening for caller...');
+        console.log('[AudioHook] Waiting for caller audio input...');
+
+        // Fallback: If no audio/silence detection triggers within 7 seconds, proceed automatically
+        noInputTimer = setTimeout(() => {
+          if (state === 'LISTENING') {
+            console.log('[AudioHook] No-input timeout reached. Defaulting name and transferring...');
+            state = 'PLAYING_INFO';
+            speak('Thank you. Transferring you to an agent now.').then(() => {
+              disconnectToAgent('Alex Mercer');
+            });
+          }
+        }, 7000);
         return;
       }
 
@@ -125,14 +137,15 @@ wss.on('connection', (ws, req) => {
           silenceFrames = 0;
         }
 
-        if (silenceFrames > 15 && audioBuffer.length > 25) {
+        // Caller spoke then went silent
+        if (silenceFrames > 12 && audioBuffer.length > 20) {
+          if (noInputTimer) clearTimeout(noInputTimer);
           state = 'PROCESSING';
           audioBuffer = [];
 
-          console.log('[Bot] Caller finished speaking. Resolved: Alex Mercer');
+          console.log('[Bot] Voice detected and processed. Resolved Name: Alex Mercer');
           state = 'PLAYING_INFO';
-          await speak('Thank you Alex Mercer. Transferring you to an agent.');
-
+          await speak('Thank you Alex Mercer. Transferring to an agent.');
           disconnectToAgent('Alex Mercer');
         }
       }
@@ -143,12 +156,21 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(data.toString());
       clientSeq = msg.seq ?? clientSeq;
-      console.log(`[AudioHook] Received event: [${msg.type}] seq=${msg.seq}`);
 
       switch (msg.type) {
         case 'open': {
           sessionId = msg.id;
           console.log(`[AudioHook] Session Open request ID: ${sessionId}`);
+
+          // Exact echo of requested media parameters
+          const negotiatedMedia = msg.parameters?.media || [
+            {
+              type: 'audio',
+              format: 'PCMU',
+              channels: ['external'],
+              rate: 8000,
+            },
+          ];
 
           const openedResponse = {
             version: '2',
@@ -158,64 +180,53 @@ wss.on('connection', (ws, req) => {
             clientseq: clientSeq,
             parameters: {
               startPaused: false,
-              media: [
-                {
-                  type: 'audio',
-                  format: 'PCMU',
-                  channels: ['external'],
-                  rate: 8000
-                }
-              ]
-            }
+              media: negotiatedMedia,
+            },
           };
 
           ws.send(JSON.stringify(openedResponse));
-          console.log('[AudioHook] Handshake sent. Waiting for media channel stream...');
+          console.log('[AudioHook] Handshake sent. Waiting for initial media frame...');
           break;
         }
-
-        case 'error':
-          // Log detailed error from Genesys
-          console.error('[AudioHook ERROR PAYLOAD FROM GENESYS]:', JSON.stringify(msg, null, 2));
-          break;
 
         case 'playback_started':
         case 'playback_completed':
           console.log(`[AudioHook] Handled: ${msg.type}`);
           break;
 
-        case 'ping':
-          ws.send(
-            JSON.stringify({
-              version: '2',
-              type: 'pong',
-              id: sessionId,
-              seq: serverSeq++,
-              clientseq: clientSeq,
-              parameters: {},
-            })
-          );
+        case 'ping': {
+          // Strictly mirror the incoming ping sequence as clientseq
+          const pongResponse = {
+            version: '2',
+            type: 'pong',
+            id: sessionId,
+            seq: serverSeq++,
+            clientseq: msg.seq,
+            parameters: {},
+          };
+          ws.send(JSON.stringify(pongResponse));
           break;
+        }
 
         case 'close': {
+          if (noInputTimer) clearTimeout(noInputTimer);
           console.log(`[AudioHook] Genesys closed session. Reason:`, msg.parameters?.reason || 'none');
           state = 'CLOSED';
-          ws.send(
-            JSON.stringify({
-              version: '2',
-              type: 'closed',
-              id: sessionId,
-              seq: serverSeq++,
-              clientseq: clientSeq,
-              parameters: {},
-            })
-          );
+          const closedResponse = {
+            version: '2',
+            type: 'closed',
+            id: sessionId,
+            seq: serverSeq++,
+            clientseq: clientSeq,
+            parameters: {},
+          };
+          ws.send(JSON.stringify(closedResponse));
           ws.close();
           break;
         }
 
         default:
-          console.log(`[AudioHook] Other message: ${msg.type}`);
+          console.log(`[AudioHook] Event: ${msg.type}`);
       }
     } catch (err) {
       console.error('[AudioHook] Parsing error:', err.message);
@@ -223,11 +234,13 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', (code, reasonBuffer) => {
+    if (noInputTimer) clearTimeout(noInputTimer);
     const reason = reasonBuffer ? reasonBuffer.toString() : 'None';
     console.log(`[AudioHook] Session closed: ${sessionId} | Code: ${code} | Reason: ${reason}`);
   });
 
   ws.on('error', (err) => {
+    if (noInputTimer) clearTimeout(noInputTimer);
     console.error('[AudioHook] Socket error:', err.message);
   });
 });
