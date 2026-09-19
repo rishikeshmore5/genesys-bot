@@ -10,7 +10,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-console.log('[Bot Init] Running Mock Mode with strict AudioHook v2 Binary Framing.');
+console.log('[Bot Init] AudioHook v2 Server initialized.');
 
 // Convert 16-bit linear PCM to 8-bit mu-law (G.711 PCMU)
 function linearToMuLaw(sample) {
@@ -43,43 +43,34 @@ function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
   return buffer;
 }
 
-// Wrap raw audio buffer in AudioHook Binary Frame Format
-// [0x02 (Audio Message Type)] + [4-byte Big-Endian Length] + [Raw Audio Data]
-function createAudioHookFrame(audioPayload) {
-  const header = Buffer.alloc(5);
-  header.writeUInt8(0x02, 0); // 0x02 indicates audio data frame
-  header.writeUInt32BE(audioPayload.length, 1);
-  return Buffer.concat([header, audioPayload]);
-}
-
 wss.on('connection', (ws, req) => {
   let serverSeq = 1;
   let clientSeq = 1;
   let sessionId = '';
-  let state = 'INIT';
+  let state = 'WAITING_MEDIA'; // WAITING_MEDIA -> ASKING_NAME -> LISTENING -> PROCESSING -> PLAYING_INFO -> DISCONNECTING
   let audioBuffer = [];
   let silenceFrames = 0;
+  let hasInitiatedGreeting = false;
 
   console.log(`[AudioHook] Client connected: ${req.url}`);
 
+  // Stream raw PCMU audio in standard 20ms (160 bytes) packets
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
-    const rawAudio = generateMockMuLawAudio(1200, 440);
+    const rawAudio = generateMockMuLawAudio(1400, 440);
 
-    // Stream out in 640-byte audio slices (~80ms each)
-    const chunkSize = 640;
+    const chunkSize = 160; // 20ms at 8000 Hz 8-bit
     for (let i = 0; i < rawAudio.length; i += chunkSize) {
       if (ws.readyState === ws.OPEN && state !== 'CLOSED') {
         const slice = rawAudio.subarray(i, i + chunkSize);
-        const framedPacket = createAudioHookFrame(slice);
-        ws.send(framedPacket, { binary: true });
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        ws.send(slice, { binary: true });
+        await new Promise((resolve) => setTimeout(resolve, 20)); // Exact 20ms real-time pacing
       }
     }
   }
 
   async function transcribeAudio(buffer) {
-    console.log(`[Bot STT]: Received ${buffer.length} bytes of caller audio.`);
+    console.log(`[Bot STT]: Received ${buffer.length} bytes of caller voice.`);
     return 'Alex Mercer';
   }
 
@@ -106,18 +97,24 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', async (data, isBinary) => {
-    // 1. CALLER VOICE CHUNKS FROM GENESYS
+    // 1. INCOMING AUDIO FROM CALLER
     if (isBinary) {
-      // If Genesys wrapped incoming audio with header, strip the 5-byte header if present
-      let rawData = data;
-      if (data.length > 5 && data.readUInt8(0) === 0x02) {
-        rawData = data.subarray(5);
+      // First incoming audio packet proves Genesys media channel is fully ready!
+      if (!hasInitiatedGreeting) {
+        hasInitiatedGreeting = true;
+        state = 'ASKING_NAME';
+        console.log('[AudioHook] Media channel confirmed open by Genesys. Playing prompt now...');
+        await speak('Hello! Could you please state your full name?');
+        state = 'LISTENING';
+        console.log('[AudioHook] Waiting for caller response...');
+        return;
       }
 
       if (state === 'LISTENING') {
-        audioBuffer.push(rawData);
+        audioBuffer.push(data);
 
-        const isSilent = rawData.every(
+        // Check for mu-law silence (0xFF or 0x7F)
+        const isSilent = data.every(
           (byte) => byte === 0xff || byte === 0x7f || (byte >= 0x7e && byte <= 0x81)
         );
 
@@ -127,7 +124,8 @@ wss.on('connection', (ws, req) => {
           silenceFrames = 0;
         }
 
-        if (silenceFrames > 8 && audioBuffer.length > 15) {
+        // Caller spoke and then stopped (~1.5s silence)
+        if (silenceFrames > 15 && audioBuffer.length > 25) {
           state = 'PROCESSING';
           const fullAudio = Buffer.concat(audioBuffer);
           audioBuffer = [];
@@ -176,18 +174,13 @@ wss.on('connection', (ws, req) => {
           };
 
           ws.send(JSON.stringify(openedResponse));
-          console.log('[AudioHook] Handshake complete. Playing greeting...');
-
-          state = 'ASKING_NAME';
-          await speak('Hello! Could you please state your full name?');
-          state = 'LISTENING';
-          console.log('[AudioHook] Waiting for caller audio input...');
+          console.log('[AudioHook] Handshake sent. Waiting for media channel initialization...');
           break;
         }
 
         case 'playback_started':
         case 'playback_completed':
-          console.log(`[AudioHook] Handled playback event: ${msg.type}`);
+          console.log(`[AudioHook] Lifecycle event: ${msg.type}`);
           break;
 
         case 'ping':
