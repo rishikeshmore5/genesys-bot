@@ -1,10 +1,8 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
 
-// Render provides PORT dynamically (often 10000)
 const PORT = process.env.PORT || 8080;
 
-// 1. Handle Render HTTP health check / port scanner
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('AudioHook Bot Server Running OK\n');
@@ -12,7 +10,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-console.log('[Bot Init] Running Mock Mode with Render Port Binding.');
+console.log('[Bot Init] Running Mock Mode with AudioHook v2 compliance.');
 
 // Convert 16-bit linear PCM to 8-bit mu-law (G.711 PCMU)
 function linearToMuLaw(sample) {
@@ -32,7 +30,7 @@ function linearToMuLaw(sample) {
   return byte & 0xff;
 }
 
-// Generates valid PCMU 8kHz audio packets
+// Generate valid PCMU 8kHz audio packets
 function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
   const sampleRate = 8000;
   const numSamples = Math.floor((sampleRate * durationMs) / 1000);
@@ -45,7 +43,7 @@ function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
   return buffer;
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let serverSeq = 1;
   let clientSeq = 1;
   let sessionId = '';
@@ -53,17 +51,18 @@ wss.on('connection', (ws) => {
   let audioBuffer = [];
   let silenceFrames = 0;
 
-  console.log('[AudioHook] New incoming connection.');
+  console.log(`[AudioHook] Client connected: ${req.url}`);
 
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
     const audioData = generateMockMuLawAudio(1200, 440);
 
-    const chunkSize = 800;
+    // Send in standard 160-byte packets (20ms) or 800-byte packets (100ms)
+    const chunkSize = 640; // 80ms chunks
     for (let i = 0; i < audioData.length; i += chunkSize) {
       if (ws.readyState === ws.OPEN) {
         ws.send(audioData.subarray(i, i + chunkSize));
-        await new Promise((resolve) => setTimeout(resolve, 95));
+        await new Promise((resolve) => setTimeout(resolve, 75));
       }
     }
   }
@@ -101,7 +100,7 @@ wss.on('connection', (ws) => {
       if (state === 'LISTENING') {
         audioBuffer.push(data);
 
-        // Check for mu-law silence (0xFF or 0x7F)
+        // Check for mu-law silence
         const isSilent = data.every(
           (byte) => byte === 0xff || byte === 0x7f || (byte >= 0x7e && byte <= 0x81)
         );
@@ -112,7 +111,6 @@ wss.on('connection', (ws) => {
           silenceFrames = 0;
         }
 
-        // Trigger after ~1.5 seconds of silence and sufficient voice data
         if (silenceFrames > 8 && audioBuffer.length > 15) {
           state = 'PROCESSING';
           const fullAudio = Buffer.concat(audioBuffer);
@@ -133,19 +131,13 @@ wss.on('connection', (ws) => {
     // 2. PROTOCOL CONTROL MESSAGES
     try {
       const msg = JSON.parse(data.toString());
-      clientSeq = msg.seq || clientSeq;
+      clientSeq = msg.seq ?? clientSeq;
+      console.log(`[AudioHook] Received event: [${msg.type}] seq=${msg.seq}`);
 
       switch (msg.type) {
         case 'open': {
           sessionId = msg.id;
           console.log(`[AudioHook] Session Open request: ${sessionId}`);
-
-          const requestedMedia = msg.parameters?.media?.[0] || {
-            type: 'audio',
-            format: 'PCMU',
-            channels: ['external'],
-            rate: 8000,
-          };
 
           const openedResponse = {
             version: '2',
@@ -155,23 +147,34 @@ wss.on('connection', (ws) => {
             id: sessionId,
             parameters: {
               startPaused: false,
-              media: [requestedMedia],
+              media: [
+                {
+                  type: 'audio',
+                  format: 'PCMU',
+                  channels: ['external'],
+                  rate: 8000,
+                  discard: 'none',
+                },
+              ],
             },
           };
 
           ws.send(JSON.stringify(openedResponse));
+          console.log('[AudioHook] Handshake complete. Playing greeting...');
 
           state = 'ASKING_NAME';
           await speak('Hello! Could you please state your full name?');
           state = 'LISTENING';
-          console.log('[AudioHook] Prompt played. Listening for caller audio...');
+          console.log('[AudioHook] Waiting for caller audio input...');
           break;
         }
 
         case 'playback_started':
+          console.log('[AudioHook] Genesys confirmed audio playback began.');
+          break;
+
         case 'playback_completed':
-          // Genesys notifies bot of audio playback events; log and maintain connection
-          console.log(`[AudioHook] Handled lifecycle event: ${msg.type}`);
+          console.log('[AudioHook] Genesys finished playing prompt to caller. Ready for speech.');
           break;
 
         case 'ping':
@@ -187,31 +190,33 @@ wss.on('connection', (ws) => {
           );
           break;
 
-        case 'close':
+        case 'close': {
+          console.log(`[AudioHook] Genesys sent close frame. Reason:`, msg.parameters?.reason || 'none');
           state = 'CLOSED';
-          ws.send(
-            JSON.stringify({
-              version: '2',
-              type: 'closed',
-              seq: serverSeq++,
-              clientseq: clientSeq,
-              id: sessionId,
-              parameters: {},
-            })
-          );
+          const closedResponse = {
+            version: '2',
+            type: 'closed',
+            seq: serverSeq++,
+            clientseq: clientSeq,
+            id: sessionId,
+            parameters: {},
+          };
+          ws.send(JSON.stringify(closedResponse));
           ws.close();
           break;
+        }
 
         default:
-          console.log(`[AudioHook] Received event: ${msg.type}`);
+          console.log(`[AudioHook] Unhandled event type: ${msg.type}`, msg);
       }
     } catch (err) {
       console.error('[AudioHook] JSON parsing error:', err.message);
     }
   });
 
-  ws.on('close', () => {
-    console.log(`[AudioHook] Session closed: ${sessionId}`);
+  ws.on('close', (code, reasonBuffer) => {
+    const reason = reasonBuffer ? reasonBuffer.toString() : 'None';
+    console.log(`[AudioHook] Session closed: ${sessionId} | Code: ${code} | Reason: ${reason}`);
   });
 
   ws.on('error', (err) => {
@@ -219,7 +224,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Explicitly bind 0.0.0.0 so Render port scanner detects it
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`AudioHook Bot Server active on 0.0.0.0:${PORT}`);
 });
