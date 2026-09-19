@@ -52,16 +52,27 @@ wss.on('connection', (ws, req) => {
 
   console.log(`[AudioHook] Client connected: ${req.url}`);
 
+  // Stream PCMU audio paced precisely to real-time wall clock
   async function speak(text) {
     console.log(`[Bot Speaking]: "${text}"`);
     const rawAudio = generateMockMuLawAudio(1200, 440);
 
-    const chunkSize = 160; // 20ms at 8000Hz 8-bit PCMU
+    // 640 bytes = 80ms of audio at 8000 Hz 8-bit mono
+    const chunkSize = 640; 
+    const frameDurationMs = (chunkSize / 8000) * 1000; // 80 ms
+
+    let nextSendTime = Date.now();
+
     for (let i = 0; i < rawAudio.length; i += chunkSize) {
-      if (ws.readyState === ws.OPEN && state !== 'CLOSED') {
-        const slice = rawAudio.subarray(i, i + chunkSize);
-        ws.send(slice, { binary: true });
-        await new Promise((resolve) => setTimeout(resolve, 20));
+      if (ws.readyState !== ws.OPEN || state === 'CLOSED') break;
+
+      const slice = rawAudio.subarray(i, i + chunkSize);
+      ws.send(slice, { binary: true });
+
+      nextSendTime += frameDurationMs;
+      const delay = Math.max(0, nextSendTime - Date.now());
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
