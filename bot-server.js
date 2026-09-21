@@ -1,5 +1,6 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
+import https from 'https';
 
 const PORT = process.env.PORT || 8080;
 
@@ -10,8 +11,9 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-console.log('[Bot Init] AudioHook v2 Server initialized.');
+console.log('[Bot Init] AudioHook v2 Voice Bot Server initialized.');
 
+// Convert 16-bit linear PCM to 8-bit mu-law (G.711 PCMU)
 function linearToMuLaw(sample) {
   const BIAS = 0x84;
   const CLIP = 32635;
@@ -29,16 +31,54 @@ function linearToMuLaw(sample) {
   return byte & 0xff;
 }
 
-function generateMockMuLawAudio(durationMs = 1200, freqHz = 440) {
-  const sampleRate = 8000;
-  const numSamples = Math.floor((sampleRate * durationMs) / 1000);
-  const buffer = Buffer.alloc(numSamples);
+// Resample 24kHz/16kHz raw PCM down to 8kHz mu-law for telephony
+function resamplePcmToMuLaw8k(pcm16Buffer, sourceRate = 24000) {
+  const sampleCount = Math.floor(pcm16Buffer.length / 2);
+  const downsampleRatio = sourceRate / 8000;
+  const outputLength = Math.floor(sampleCount / downsampleRatio);
+  const muLawBuffer = Buffer.alloc(outputLength);
 
-  for (let i = 0; i < numSamples; i++) {
-    const sampleVal = Math.floor(16000 * Math.sin((2 * Math.PI * freqHz * i) / sampleRate));
-    buffer[i] = linearToMuLaw(sampleVal);
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = Math.floor(i * downsampleRatio) * 2;
+    if (srcIndex + 1 < pcm16Buffer.length) {
+      const pcmSample = pcm16Buffer.readInt16LE(srcIndex);
+      muLawBuffer[i] = linearToMuLaw(pcmSample);
+    }
   }
-  return buffer;
+  return muLawBuffer;
+}
+
+// Fetch natural spoken voice audio over HTTPS
+function fetchSpokenAudio(text) {
+  return new Promise((resolve) => {
+    const encodedText = encodeURIComponent(text);
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodedText}&tl=en&client=tw-ob`;
+
+    https
+      .get(
+        url,
+        {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('end', () => {
+            const rawBuffer = Buffer.concat(chunks);
+            // Downsample and encode into 8kHz PCMU (mu-law)
+            const audio8k = resamplePcmToMuLaw8k(rawBuffer, 24000);
+            resolve(audio8k);
+          });
+        }
+      )
+      .on('error', (err) => {
+        console.warn('[TTS Warning] TTS fetch failed, generating silence buffer:', err.message);
+        resolve(Buffer.alloc(8000, 0xff)); // Fallback to 1 second of silence
+      });
+  });
 }
 
 wss.on('connection', (ws, req) => {
@@ -55,10 +95,10 @@ wss.on('connection', (ws, req) => {
 
   // Stream PCMU audio paced precisely to real-time wall clock (80ms chunks)
   async function speak(text) {
-    console.log(`[Bot Speaking]: "${text}"`);
-    const rawAudio = generateMockMuLawAudio(1200, 440);
+    console.log(`[Bot Speaking Real Voice]: "${text}"`);
+    const rawAudio = await fetchSpokenAudio(text);
 
-    const chunkSize = 640; // 80ms chunks
+    const chunkSize = 640; // 80ms chunks at 8000 Hz 8-bit mono
     const frameDurationMs = (chunkSize / 8000) * 1000;
     let nextSendTime = Date.now();
 
@@ -106,12 +146,12 @@ wss.on('connection', (ws, req) => {
       if (!hasInitiatedGreeting) {
         hasInitiatedGreeting = true;
         state = 'ASKING_NAME';
-        console.log('[AudioHook] Media channel verified! Playing prompt...');
+        console.log('[AudioHook] Media channel verified! Playing real voice greeting...');
         await speak('Hello! Could you please state your full name?');
         state = 'LISTENING';
         console.log('[AudioHook] Waiting for caller audio input...');
 
-        // Fallback: If no audio/silence detection triggers within 7 seconds, proceed automatically
+        // Fallback: If no input/silence triggers within 8 seconds, automatically proceed
         noInputTimer = setTimeout(() => {
           if (state === 'LISTENING') {
             console.log('[AudioHook] No-input timeout reached. Defaulting name and transferring...');
@@ -120,7 +160,7 @@ wss.on('connection', (ws, req) => {
               disconnectToAgent('Alex Mercer');
             });
           }
-        }, 7000);
+        }, 8000);
         return;
       }
 
@@ -137,7 +177,7 @@ wss.on('connection', (ws, req) => {
           silenceFrames = 0;
         }
 
-        // Caller spoke then went silent
+        // Caller spoke and then stopped (~1.5 seconds of silence)
         if (silenceFrames > 12 && audioBuffer.length > 20) {
           if (noInputTimer) clearTimeout(noInputTimer);
           state = 'PROCESSING';
@@ -145,7 +185,7 @@ wss.on('connection', (ws, req) => {
 
           console.log('[Bot] Voice detected and processed. Resolved Name: Alex Mercer');
           state = 'PLAYING_INFO';
-          await speak('Thank you Alex Mercer. Transferring to an agent.');
+          await speak('Thank you Alex Mercer. Transferring you to an agent.');
           disconnectToAgent('Alex Mercer');
         }
       }
@@ -162,7 +202,6 @@ wss.on('connection', (ws, req) => {
           sessionId = msg.id;
           console.log(`[AudioHook] Session Open request ID: ${sessionId}`);
 
-          // Exact echo of requested media parameters
           const negotiatedMedia = msg.parameters?.media || [
             {
               type: 'audio',
@@ -195,7 +234,6 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'ping': {
-          // Strictly mirror the incoming ping sequence as clientseq
           const pongResponse = {
             version: '2',
             type: 'pong',
